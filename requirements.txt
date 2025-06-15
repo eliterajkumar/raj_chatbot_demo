@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+uvicorn
+pydantic
+langchain
+langchain-community
+langchain-huggingface
+langchain-ollama # Still keep this for Ollama integration (though LLM class is in community now)
+chromadb
+sentence-transformers
+pymongo
+python-dotenv # Optional, for managing environment variables
