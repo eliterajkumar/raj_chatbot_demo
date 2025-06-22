@@ -1,13 +1,21 @@
+# Core web framework
 fastapi
-uvicorn
-pydantic
-uvicorn
-pydantic
-langchain
-langchain-community
-langchain-huggingface
-langchain-ollama # Still keep this for Ollama integration (though LLM class is in community now)
-chromadb
-sentence-transformers
-pymongo
-python-dotenv # Optional, for managing environment variables
+uvicorn[standard]
+
+# Utilities
+python-dotenv
+python-multipart # For file uploads
+
+# RAG Chatbot dependencies
+PyMuPDF
+scikit-learn
+numpy
+
+# AI Voice Bot dependencies
+openai # For Whisper API
+
+# Multilingual Chatbot dependencies
+googletrans==4.0.0rc1
+
+# General purpose
+requests # For all HTTP requests 
