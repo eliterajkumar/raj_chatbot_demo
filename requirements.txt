@@ -51,7 +51,7 @@ einops==0.8.1
 emoji==2.14.1
 evaluate==0.4.1
 faiss-cpu==1.11.0
-fastapi==0.110.0
+fastapi==0.115.9
 fastcore==1.8.2
 ffmpy==0.6.0
 filelock==3.18.0
@@ -72,14 +72,13 @@ google-cloud-storage==3.1.0
 google-crc32c==1.7.1
 google-resumable-media==2.7.2
 googleapis-common-protos==1.70.0
-googletrans==4.0.0rc1
 gradio==5.23.3
 gradio_client==1.8.0
 greenlet==3.2.3
 groovy==0.1.2
 grpcio==1.72.1
 grpclib==0.4.7
-h11==0.9.0
+h11==0.16.0
 h2==3.2.0
 hf-xet==1.1.0
 hf_transfer==0.1.9
@@ -87,9 +86,9 @@ hpack==3.0.0
 hqq==0.2.5
 hstspreload==2025.1.1
 html5lib==1.1
-httpcore==0.9.1
+httpcore==1.0.9
 httptools==0.6.4
-httpx==0.13.3
+httpx==0.27.0
 httpx-sse==0.4.0
 huggingface-hub==0.31.0
 humanfriendly==10.0
@@ -140,7 +139,7 @@ networkx==3.5
 nltk==3.9.1
 numba==0.61.2
 numexpr==2.10.2
-numpy==2.0.1
+numpy==2.2.1
 nvidia-cublas-cu12==12.4.5.8
 nvidia-cuda-cupti-cu12==12.4.127
 nvidia-cuda-nvrtc-cu12==12.4.127
@@ -249,7 +248,7 @@ sniffio==1.3.1
 soupsieve==2.7
 SQLAlchemy==2.0.41
 sqlitedict==2.1.0
-starlette==0.36.3
+starlette==0.45.3
 sympy==1.13.1
 synchronicity==0.9.13
 tabledata==1.3.4
