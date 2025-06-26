@@ -9,7 +9,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Unified AI Services API",
-    description="A single backend for RAG Chatbot, AI Voice Bot, and Multilingual Chatbot.",
+    description="A single backend for RAG Chatbot, AI Voice Bot, and Multilingual Chatbot (English only).",
     version="1.0.0"
 )
 
@@ -25,7 +25,7 @@ app.add_middleware(
 # Include the routers from each project
 app.include_router(rag_router.router, prefix="/rag", tags=["RAG Chatbot"])
 app.include_router(voice_router.router, prefix="/voice", tags=["AI Voice Bot"])
-app.include_router(multilingual_router.router, prefix="/multilingual", tags=["Multilingual Chatbot"])
+app.include_router(multilingual_router.router, prefix="/multilingual", tags=["Multilingual Chatbot (English only)"])
 
 @app.get("/", tags=["Root"])
 def read_root():

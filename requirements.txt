@@ -4,6 +4,5 @@ python-dotenv
 requests
 PyMuPDF
 scikit-learn
-googletrans==4.0.0rc1
-uvicorn
 python-multipart
+uvicorn
