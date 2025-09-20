@@ -1,25 +1,42 @@
 import fitz  # PyMuPDF
 from typing import List
+import os
+import io
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extracts raw text from a PDF file's bytes."""
+def parse_pdf(path_or_bytes):
+    """
+    Accept either file path or raw bytes. Returns extracted text.
+    """
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = "\n".join(page.get_text() for page in doc)
-        doc.close()
-        return text
+        # If given bytes
+        if isinstance(path_or_bytes, (bytes, bytearray)):
+            return extract_text_from_pdf(path_or_bytes)
+        # If given path string
+        if isinstance(path_or_bytes, str) and os.path.exists(path_or_bytes):
+            with open(path_or_bytes, "rb") as f:
+                data = f.read()
+            return extract_text_from_pdf(data)
+        raise ValueError("parse_pdf expects file path or bytes")
     except Exception as e:
-        raise ValueError(f"Error reading PDF content: {e}")
+        raise
 
-def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
-    """Splits a long text into smaller, overlapping chunks."""
-    if not isinstance(text, str):
-        raise TypeError("Input text must be a string.")
-    
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - chunk_overlap
-    return chunks 
+def ocr_image(path_or_bytes):
+    """
+    Basic OCR wrapper: for now read file bytes and run pytesseract if available.
+    Returns extracted text (string).
+    """
+    try:
+        from PIL import Image
+        import pytesseract
+    except Exception:
+        return ""  # if OCR libs not installed, return empty string
+
+    if isinstance(path_or_bytes, (bytes, bytearray)):
+        img = Image.open(io.BytesIO(path_or_bytes))
+    elif isinstance(path_or_bytes, str) and os.path.exists(path_or_bytes):
+        img = Image.open(path_or_bytes)
+    else:
+        raise ValueError("ocr_image expects file path or bytes")
+
+    text = pytesseract.image_to_string(img)
+    return text
