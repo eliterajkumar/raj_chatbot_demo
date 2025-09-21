@@ -6,3 +6,7 @@ PyMuPDF
 scikit-learn
 python-multipart
 uvicorn
+sentence-transformers==2.2.2
+torch==2.2.0
+transformers==4.35.2
+faiss-cpu==1.7.4
