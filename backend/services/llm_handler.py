@@ -3,7 +3,7 @@ import os
 import logging
 from typing import Optional
 from openai import OpenAI
-from openai.error import APIConnectionError, OpenAIError
+from openai import OpenAI, APIConnectionError, OpenAIError
 
 # Configure logger
 logger = logging.getLogger("backend.services.llm_handler")
