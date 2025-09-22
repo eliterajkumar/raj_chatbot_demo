@@ -3,316 +3,115 @@ import os
 import json
 import uuid
 import threading
-import io
-import logging
 from typing import List, Dict, Optional
 
-import requests
+# embeddings
+from sentence_transformers import SentenceTransformer
 import numpy as np
 
-# Attempt chromadb import lazily inside get_chroma_client to avoid import-time crashes
-_chromadb_imported = True
-try:
-    import chromadb  # type: ignore
-    from chromadb.config import Settings  # type: ignore
-except Exception:
-    chromadb = None  # type: ignore
-    Settings = None  # type: ignore
-    _chromadb_imported = False
+# faiss
+import faiss
 
-# PDF / OCR helpers (optional)
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
-
-try:
-    from PIL import Image
-    import pytesseract
-except Exception:
-    Image = None
-    pytesseract = None
-
-logger = logging.getLogger("vector_store")
-logger.setLevel(logging.INFO)
-
-# --- Config ---
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VECTOR_DIR = os.environ.get("VECTOR_DIR", os.path.join(BASE_DIR, "..", "vector_store"))
 os.makedirs(VECTOR_DIR, exist_ok=True)
-
-CHROMA_PERSIST_DIR = os.path.join(VECTOR_DIR, "chroma_db")
-CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "fynorra_docs")
-
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN")  # required for HF Inference API
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-HF_EMBED_URL = os.environ.get(
-    "HF_EMBED_URL",
-    f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL}",
-)
+VECTOR_INDEX_PATH = os.path.join(VECTOR_DIR, "faiss.index")
+VECTOR_META_PATH = os.path.join(VECTOR_DIR, "metadata.json")
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 _lock = threading.Lock()
 
-# --- in-memory fallback store shape (used when Chroma unavailable) ---
-# {"_in_memory": True, "ids": [...], "documents": [...], "metadatas": [...], "embeddings": [..]}
-_in_memory_store: Optional[Dict] = None
+# Load model once
+_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+_dim = _model.get_sentence_embedding_dimension()
 
-# ---------------- Chroma client lazy init ----------------
-_chroma_client = None
-_collection = None
+# In-memory metadata list (parallel to FAISS IDs)
+if os.path.exists(VECTOR_META_PATH):
+    with open(VECTOR_META_PATH, "r", encoding="utf-8") as f:
+        _metadata = json.load(f)
+else:
+    _metadata = []  # list of dicts containing {id, text, source, conversation_id, other_meta}
 
+# Load or init FAISS index
+if os.path.exists(VECTOR_INDEX_PATH):
+    try:
+        _index = faiss.read_index(VECTOR_INDEX_PATH)
+        # Ensure dimension matches
+        if _index.d != _dim:
+            # rebuild index if mismatch
+            _index = faiss.IndexFlatIP(_dim)
+            # if there are existing metadata, re-embed? safer to start fresh
+            _metadata = []
+    except Exception as e:
+        print("faiss load error:", e)
+        _index = faiss.IndexFlatIP(_dim)
+else:
+    _index = faiss.IndexFlatIP(_dim)  # inner product (use normalized vectors)
 
-def get_chroma_client():
-    """
-    Lazily create and return (client, collection).
-    If chromadb is missing or config incompatible, fallback to in-memory store.
-    """
-    global _chroma_client, _collection, _in_memory_store
-
-    if _chroma_client is not None or _collection is not None or _in_memory_store is not None:
-        # if _in_memory_store exists, return that as collection
-        if _in_memory_store is not None:
-            return None, _in_memory_store
-        return _chroma_client, _collection
-
-    # Try to initialize chromadb client if import succeeded
-    if _chromadb_imported and chromadb is not None:
-        try:
-            # primary attempt: explicit Settings (duckdb+parquet)
-            client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_PERSIST_DIR))
-            logger.info("Chroma client initialized with duckdb+parquet persist.")
-        except Exception as exc1:
-            logger.warning("Primary Chroma init failed: %s. Trying fallback client()", exc1)
-            try:
-                client = chromadb.Client()  # let chromadb decide defaults
-                logger.info("Chroma client initialized with chromadb.Client() fallback.")
-            except Exception as exc2:
-                logger.error("Chroma fallback client() failed: %s. Will use in-memory store.", exc2)
-                client = None
-
-        if client:
-            try:
-                # ensure collection exists
-                try:
-                    collection = client.get_collection(CHROMA_COLLECTION)
-                except Exception:
-                    collection = client.create_collection(CHROMA_COLLECTION)
-                _chroma_client = client
-                _collection = collection
-                return _chroma_client, _collection
-            except Exception as exc3:
-                logger.error("Failed ensuring chroma collection: %s. Falling back to in-memory.", exc3)
-                client = None
-
-    # Final fallback -> in-memory store
-    _in_memory_store = {"_in_memory": True, "ids": [], "documents": [], "metadatas": [], "embeddings": []}
-    logger.info("Using in-memory vector store fallback (non-persistent).")
-    return None, _in_memory_store
-
-
-# ---------------- Embedding utilities ----------------
-def _hf_embed_texts(texts: List[str], batch_size: int = 8) -> List[List[float]]:
-    """
-    Use Hugging Face Inference API (feature-extraction pipeline) to get embeddings.
-    Returns list of vectors (floats). No local torch required.
-    """
-    if not HF_API_TOKEN:
-        raise ValueError("HF_API_TOKEN environment variable not set (needed for HF inference).")
-
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"}
-    embeddings: List[List[float]] = []
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        resp = requests.post(HF_EMBED_URL, headers=headers, json=batch, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        for item in data:
-            if isinstance(item, list) and len(item) > 0 and isinstance(item[0], list):
-                vec = np.mean(np.array(item, dtype=np.float32), axis=0).astype(float).tolist()
-            else:
-                vec = [float(x) for x in item]
-            embeddings.append(vec)
-
-    return embeddings
-
-
-def _normalize_vectors(vs: List[List[float]]) -> List[List[float]]:
-    arr = np.array(vs, dtype=np.float32)
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+# helper: normalize vectors for IP similarity
+def _normalize(v: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    arr = arr / norms
-    return arr.astype(float).tolist()
+    return v / norms
 
-
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """
-    a: (d,) vector
-    b: (n, d) matrix
-    returns: (n,) similarity scores
-    """
-    if a.ndim == 1:
-        a = a / (np.linalg.norm(a) if np.linalg.norm(a) != 0 else 1.0)
-    b_norms = np.linalg.norm(b, axis=1)
-    b_norms[b_norms == 0] = 1.0
-    b = b / b_norms[:, None]
-    sims = np.dot(b, a)
-    return sims
-
-
-# ---------------- Chroma operations ----------------
 def upsert_chunks(chunks: List[str], metadata: Dict):
     """
-    Insert chunks list into Chroma with metadata.
-    metadata is attached per-chunk (source, conversation_id, meta dict)
+    chunks: list of text chunks
+    metadata: dict to attach to each chunk (e.g., {"source": "file.pdf", "conversation_id": "..."})
     """
+    global _index, _metadata
     if not chunks:
-        return []
-
-    ids = [str(uuid.uuid4()) for _ in chunks]
-    metas = []
-    for _ in chunks:
-        metas.append(
-            {
-                "source": metadata.get("source"),
-                "conversation_id": metadata.get("conversation_id"),
-                "meta": metadata.get("meta", {}),
-            }
-        )
+        return
 
     with _lock:
-        # get embeddings from HF
-        embs = _hf_embed_texts(chunks)
-        embs = _normalize_vectors(embs)
-
-        client, collection = get_chroma_client()
-
-        # If using in-memory fallback:
-        if collection and isinstance(collection, dict) and collection.get("_in_memory"):
-            for i, txt in enumerate(chunks):
-                collection["ids"].append(ids[i])
-                collection["documents"].append(txt)
-                collection["metadatas"].append(metas[i])
-                collection["embeddings"].append(embs[i])
-            return ids
-
-        # Else operate with Chroma collection
+        embeddings = _model.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
+        embeddings = _normalize(embeddings.astype("float32"))
+        # Add to index
         try:
-            collection.add(ids=ids, documents=chunks, metadatas=metas, embeddings=embs)
-            try:
-                # persist if possible
-                if client:
-                    client.persist()
-            except Exception:
-                # persist failing shouldn't block
-                logger.debug("client.persist() raised; ignoring for now.")
+            _index.add(embeddings)
+            # append metadata entries for each embedding
+            for i, chunk in enumerate(chunks):
+                entry = {
+                    "id": str(uuid.uuid4()),
+                    "text": chunk,
+                    "source": metadata.get("source"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "meta": metadata.get("meta", {})
+                }
+                _metadata.append(entry)
+            # persist
+            faiss.write_index(_index, VECTOR_INDEX_PATH)
+            with open(VECTOR_META_PATH, "w", encoding="utf-8") as f:
+                json.dump(_metadata, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.exception("vector_store.upsert_chunks error: %s", e)
+            print("vector_store.upsert_chunks error:", e)
             raise
-
-    return ids
-
 
 def search(query: str, top_k: int = 4) -> List[Dict]:
     """
-    Query Chroma with an embedding of the query.
-    Returns list of {source, text, meta, score}
+    Returns list of {source, text, score, meta}
     """
-    if not query:
+    global _index, _metadata
+    if not query or _index.ntotal == 0:
         return []
 
     with _lock:
-        q_emb = _hf_embed_texts([query])[0]
-        q_emb = _normalize_vectors([q_emb])[0]
-
-        client, collection = get_chroma_client()
-
-        # in-memory fallback search (brute-force cosine)
-        if collection and isinstance(collection, dict) and collection.get("_in_memory"):
-            docs = collection.get("documents", [])
-            metas = collection.get("metadatas", [])
-            emb_matrix = np.array(collection.get("embeddings", []), dtype=np.float32)
-            if emb_matrix.size == 0:
-                return []
-            sims = _cosine_sim(np.array(q_emb, dtype=np.float32), emb_matrix)
-            idx_sorted = np.argsort(-sims)[:top_k]
-            out = []
-            for idx in idx_sorted:
-                out.append(
-                    {
-                        "source": metas[idx].get("source"),
-                        "text": docs[idx],
-                        "meta": metas[idx].get("meta"),
-                        "score": float(sims[idx]),
-                    }
-                )
-            return out
-
-        # else query chroma normally
+        q_emb = _model.encode([query], convert_to_numpy=True)
+        q_emb = _normalize(q_emb.astype("float32"))
         try:
-            results = collection.query(query_embeddings=[q_emb], n_results=top_k, include=["metadatas", "documents", "distances"])
-            out = []
-            docs = results.get("documents", [[]])[0]
-            metas = results.get("metadatas", [[]])[0]
-            dists = results.get("distances", [[]])[0]
-            for doc, meta, dist in zip(docs, metas, dists):
-                out.append(
-                    {
-                        "source": meta.get("source"),
-                        "text": doc,
-                        "meta": meta.get("meta"),
-                        "score": float(dist),
-                    }
-                )
-            return out
+            D, I = _index.search(q_emb, top_k)
+            results = []
+            for score, idx in zip(D[0].tolist(), I[0].tolist()):
+                if idx < 0 or idx >= len(_metadata):
+                    continue
+                meta = _metadata[idx]
+                results.append({
+                    "source": meta.get("source"),
+                    "text": meta.get("text"),
+                    "meta": meta.get("meta"),
+                    "score": float(score)
+                })
+            return results
         except Exception as e:
-            logger.exception("vector_store.search error when querying Chroma: %s", e)
+            print("vector_store.search error:", e)
             return []
-
-
-# ---------------- PDF & OCR helpers (optional) ----------------
-def extract_text_from_pdf_bytes(data: bytes) -> str:
-    if not fitz:
-        raise RuntimeError("PyMuPDF (fitz) not installed.")
-    doc = fitz.open(stream=data, filetype="pdf")
-    parts = []
-    for page in doc:
-        parts.append(page.get_text())
-    doc.close()
-    return "\n".join(parts)
-
-
-def parse_pdf(path_or_bytes):
-    """
-    Accept either file path or raw bytes. Returns extracted text.
-    """
-    try:
-        # If given bytes
-        if isinstance(path_or_bytes, (bytes, bytearray)):
-            return extract_text_from_pdf_bytes(path_or_bytes)
-        # If given path string
-        if isinstance(path_or_bytes, str) and os.path.exists(path_or_bytes):
-            with open(path_or_bytes, "rb") as f:
-                data = f.read()
-            return extract_text_from_pdf_bytes(data)
-        raise ValueError("parse_pdf expects file path or bytes")
-    except Exception:
-        # bubble up to caller
-        raise
-
-
-def ocr_image(path_or_bytes):
-    """
-    Basic OCR wrapper: if pytesseract available, run OCR.
-    Returns extracted text (string).
-    """
-    if not Image or not pytesseract:
-        return ""  # optional: OCR not available
-    if isinstance(path_or_bytes, (bytes, bytearray)):
-        img = Image.open(io.BytesIO(path_or_bytes))
-    elif isinstance(path_or_bytes, str) and os.path.exists(path_or_bytes):
-        img = Image.open(path_or_bytes)
-    else:
-        raise ValueError("ocr_image expects file path or bytes")
-    text = pytesseract.image_to_string(img)
-    return text

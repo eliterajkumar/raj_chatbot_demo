@@ -1,103 +1,66 @@
 # backend/api/rag_router.py
-from fastapi import APIRouter, UploadFile, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
-import uuid, os, shutil, re
+import os, re
 
-from ..services import pdf_processor, vector_store, llm_handler, db
+from ..services import llm_handler, db
 
 router = APIRouter()
-
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-def save_upload_file_tmp(upload_file: UploadFile) -> str:
-    ext = os.path.splitext(upload_file.filename)[1]
-    tmp_name = f"{uuid.uuid4().hex}{ext}"
-    tmp_path = os.path.join(UPLOAD_DIR, tmp_name)
-    with open(tmp_path, "wb") as buffer:
-        shutil.copyfileobj(upload_file.file, buffer)
-    return tmp_path
-
 
 @router.post("/chat")
 async def chat_endpoint(request: Request):
     """
-    Chat endpoint for RAG assistant:
-    - JSON body: {"message":"...", "session_id":"..."}
-    - Multipart: message + optional file
+    Chat endpoint (site-only, text-only).
+    Expects JSON body: {"message":"...", "session_id":"..."}
+    Multipart/form uploads are rejected.
     """
     ct = request.headers.get("content-type", "")
-    message_text, session_id, file_path, file_url, file_kind = "", None, None, None, None
+    message_text, session_id = "", None
 
-    # Handle input
+    # Reject multipart uploads on site version
     if "multipart/form-data" in ct:
-        form = await request.form()
-        message_text = form.get("message") or ""
-        session_id = form.get("session_id") or None
-        upload = form.get("file")
-        if upload:
-            file_path = save_upload_file_tmp(upload)
-            file_kind = upload.content_type
-    else:
-        body = await request.json()
-        message_text = body.get("message") or body.get("text") or ""
-        session_id = body.get("session_id") or None
+        raise HTTPException(status_code=400, detail="File uploads are disabled on this deployment. Use demo project for file uploads.")
 
-    # Ensure conversation
+    # Parse JSON payload
+    body = await request.json()
+    message_text = body.get("message") or body.get("text") or ""
+    session_id = body.get("session_id") or None
+
+    # Ensure conversation (db.upsert_conversation should create or return conv)
     conv = db.upsert_conversation(session_id)
     conversation_id, session_id = conv["id"], conv["session_id"]
 
     # Save user message
     db.save_message(conversation_id, role="user", text=message_text, file_url=None)
 
-    # File parsing (PDF/Image OCR)
-    extracted_text = ""
-    if file_path:
-        try:
-            if file_kind == "application/pdf" or file_path.lower().endswith(".pdf"):
-                extracted_text = pdf_processor.parse_pdf(file_path)
-            else:
-                extracted_text = pdf_processor.ocr_image(file_path)
+    # No file parsing / RAG in site version
+    sources_text = ""
 
-            file_url = db.save_file_to_storage(file_path, conversation_id=conversation_id)
-            chunks = pdf_processor.chunk_text(extracted_text)
-            vector_store.upsert_chunks(chunks, metadata={"source": os.path.basename(file_path), "conversation_id": conversation_id})
-        except Exception as e:
-            print("File parse error:", e)
-
-    # Retrieve knowledge (RAG)
-    retrieved = vector_store.search(message_text, top_k=4) if message_text else []
-
-    # Persona / system prompt (polished)
+    # Persona / system prompt
     persona = (
         "You are Fynorra’s friendly Sales Assistant. "
         "Greet the user once at the start of a session with 'Namaste 🙏' and a one-line intro, "
         "then avoid repeating the greeting in subsequent replies. "
         "Speak politely in Hinglish (mix Hindi + English). "
         "Explain Fynorra services (AI Chatbots, Automation, IT Consulting) concisely, be persuasive but never pushy, "
-        "ask one qualifying question when interest is detected, and propose next step (demo/contact). "
-        "When a file has been uploaded, mention that you have received it and wait for the user to request analysis before summarizing in detail."
+        "ask one qualifying question when interest is detected, and propose next step (demo/contact)."
     )
 
     # Conversation history
     history = db.get_last_messages(conversation_id, limit=6)
     history_text = "\n".join([f"{m['role']}: {m['text']}" for m in history])
 
-    # RAG context
-    sources_text = ""
-    if retrieved:
-        for i, r in enumerate(retrieved):
-            sources_text += f"\n--- Source {i+1}: ({r.get('source')})\n{r.get('text')[:1000]}"
-    if extracted_text:
-        sources_text += f"\n--- Uploaded file content:\n{extracted_text[:2000]}"
+    # Build context for LLM (history only, no RAG)
+    context = sources_text + "\n" + history_text if history_text else sources_text
 
     # LLM call
     try:
         reply = llm_handler.get_llm_response(
             system_prompt=persona,
-            context=sources_text + "\n" + history_text,
+            context=context,
             user_question=message_text,
-            model=os.environ.get("LLM_MODEL", "openai/gpt-4o"),
+            model=os.environ.get("LLM_MODEL", None),  # optional override; llm_handler has its own default
+            request_type="chat",
         )
     except Exception as e:
         print("LLM error (full):", repr(e))
@@ -105,23 +68,65 @@ async def chat_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {msg[:500]}")
 
     # Save assistant reply
-    db.save_message(conversation_id, role="assistant", text=reply, file_url=file_url)
+    db.save_message(conversation_id, role="assistant", text=reply, file_url=None)
 
-    # Lead detection
-    interest_regex = r"(interested|demo|price|cost|quote|proposal|contact|signup|buy|purchase|meeting|schedule)"
-    is_lead = bool(re.search(interest_regex, message_text + " " + reply, flags=re.IGNORECASE))
+    # ---------------------------
+    # Safer Lead detection (weighted + contact detection)
+    # ---------------------------
+
+    def extract_contact(text: str):
+        email_re = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+        phone_re = r"(\+?\d[\d\s\-\(\)]{6,}\d)"
+        return bool(re.search(email_re, text)), bool(re.search(phone_re, text))
+
+    # higher weight = stronger buying intent
+    KEYWORD_WEIGHTS = {
+        r"\b(demo|schedule demo|book demo)\b": 0.95,
+        r"\b(price|pricing|cost|quote)\b": 0.85,
+        r"\b(interested|want to buy|purchase|signup|sign up|get started)\b": 0.75,
+        r"\b(contact|call me|reach out|connect)\b": 0.65,
+        r"\b(schedule|meeting|request demo)\b": 0.8,
+    }
+
+    def compute_interest_score(text: str):
+        score = 0.0
+        txt = (text or "").lower()
+        for kw_re, w in KEYWORD_WEIGHTS.items():
+            if re.search(kw_re, txt):
+                score = max(score, w)
+        return score
+
+    combined_text = (message_text or "") + " " + (reply or "")
+    contact_email_present, contact_phone_present = extract_contact(combined_text)
+    score_message = compute_interest_score(message_text)
+    score_combined = compute_interest_score(combined_text)
+
+    # boost if contact info present
+    if contact_email_present or contact_phone_present:
+        score_combined = max(score_combined, 0.98)
+
+    LEAD_THRESHOLD = float(os.environ.get("LEAD_THRESHOLD", 0.75))
+
+    is_lead = score_combined >= LEAD_THRESHOLD
+
+    # extra guard: don't treat short generic info questions as leads
+    if not is_lead:
+        words = (message_text or "").strip().split()
+        if len(words) < 6 and any(qw in (message_text or "").lower() for qw in ["what", "who", "how", "tell", "batao", "kya"]):
+            is_lead = False
+
     lead = None
     if is_lead:
-        lead = db.create_lead(conversation_id, snippet=message_text[:500], score=0.7, metadata={"file_url": file_url})
+        lead = db.create_lead(
+            conversation_id,
+            snippet=(message_text or "")[:500],
+            score=float(score_combined),
+            metadata={"detected_contact": contact_email_present or contact_phone_present}
+        )
         try:
             db.notify_sales(lead)
         except Exception as e:
             print("Notify sales failed:", e)
-
-    # Clean up temp file
-    if file_path and os.path.exists(file_path):
-        try: os.remove(file_path)
-        except: pass
 
     return JSONResponse({
         "reply": reply,

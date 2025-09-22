@@ -1,12 +1,7 @@
+# Core web frameworks
 fastapi
-pydantic
-python-dotenv
-requests
-PyMuPDF
-python-multipart
 uvicorn
-chromadb
-tqdm
-numpy
-Pillow    # optional for OCR
-pytesseract  # optional for OCR
+python-dotenv
+# HTTP client
+requests
+openai
