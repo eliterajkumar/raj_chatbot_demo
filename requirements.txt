@@ -3,9 +3,10 @@ pydantic
 python-dotenv
 requests
 PyMuPDF
-scikit-learn
 python-multipart
 uvicorn
-sentence-transformers
-transformers
-faiss-cpu
+chromadb
+tqdm
+numpy
+Pillow    # optional for OCR
+pytesseract  # optional for OCR
