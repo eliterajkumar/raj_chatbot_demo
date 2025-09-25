@@ -355,9 +355,9 @@ async def chat_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {msg[:500]}")
 
     # Prepend canonical greeting once if not present and assistant hasn't greeted
-    if not assistant_has_greeted and "Namaste" not in (reply or ""):
-        # add English-first greeting (per new rule)
-        greeting = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n"
+    greeting = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n"
+    # only prepend greeting if assistant hasn't greeted AND reply doesn't already look like a greeting/choice
+    if not assistant_has_greeted and not re.search(r"\b(namaste|nice to connect|would you like|overview|how can i help|reply with|'overview'|'needs')\b", (reply or "").lower()):
         reply = greeting + reply
 
     # Save assistant reply
