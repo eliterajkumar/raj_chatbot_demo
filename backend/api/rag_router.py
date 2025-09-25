@@ -17,9 +17,6 @@ logger = logging.getLogger("rag_router")
 CONTEXT_PATH = Path("context/fynorra_master_with_faqs.json")
 
 def load_master_context() -> dict:
-    """
-    Load the master JSON context. Try a few likely paths for robustness.
-    """
     candidates = [CONTEXT_PATH, Path("context/fynorra_master_with_faqs"), Path("context/fynorra_master_combined.json"),
                   Path("/mnt/data/fynorra_master_with_faqs.json"), Path("/mnt/data/fynorra_master_combined.json")]
     for p in candidates:
@@ -27,12 +24,9 @@ def load_master_context() -> dict:
             if p.exists():
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    # Normalize common shapes: prefer top-level 'company' or 'company_profile'
                     if "company_profile" in data and "company" not in data:
                         data["company"] = data.get("company_profile")
-                    # if services under top-level 'services' keep as-is; older shape 'core_services' may exist
                     if "core_services" in data and "services" not in data:
-                        # try to flatten core_services into services list
                         svc_list = []
                         for grp in data.get("core_services", []):
                             for s in grp.get("services", []):
@@ -47,31 +41,20 @@ def text_tokens_preview(text: str, n: int = 50) -> str:
     return (" ".join((text or "").split()[:n])).strip()
 
 def _extract_text_from_rag_entry(entry) -> str:
-    """
-    Given a RAG-style entry (dict or string), extract readable text for matching.
-    """
     if not entry:
         return ""
     if isinstance(entry, str):
         return entry
-    # expected formats: {"text": "...", "metadata": {...}} or {"messages": [...]}
     if isinstance(entry, dict):
         if "text" in entry:
             return entry.get("text", "")
         if "messages" in entry:
-            # join user+assistant pairs
             msgs = entry.get("messages", [])
             return " ".join([m.get("content", "") for m in msgs if isinstance(m, dict)])
-        # fallback: stringify
         return json.dumps(entry, ensure_ascii=False)
     return str(entry)
 
 def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
-    """
-    Heuristic retriever:
-    - Searches 'services' (by name/short_description), 'faqs' (rag_formatted), and 'sales_material' if present.
-    - Returns up to max_chunks text snippets joined as sources_text.
-    """
     data = load_master_context()
     if not data:
         return []
@@ -86,17 +69,13 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
     tokens_sample = set(tokens[:8])
     snippets = []
 
-    # Search services array (each service is a dict as we created earlier)
     for svc in data.get("services", []):
-        # support both flat service dict or grouped structure
         name = svc.get("service_name") or svc.get("name") or svc.get("service_id") or ""
         desc = svc.get("short_description") or svc.get("description") or svc.get("sales_pitch") or ""
         combined = f"{name} {desc}".lower()
         if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
-            short = f"Service: {name} — {desc}"
-            snippets.append(short)
+            snippets.append(f"Service: {name} — {desc}")
 
-    # Search top-level core_services groups if present (backwards compatibility)
     for grp in data.get("core_services", []):
         for svc in grp.get("services", []):
             name = svc.get("name", "")
@@ -105,19 +84,13 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
             if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
                 snippets.append(f"Service: {name} — {desc}")
 
-    # Search FAQs: we support two shapes:
-    # 1) data['faqs']['rag_formatted'] -> list of {"text": "...", "metadata": {...}}
-    # 2) data['faqs']['plain'] -> list of {"q": "...", "a":"..."} or simple list of q/a pairs
-    faqs_root = data.get("faqs", {})
-    # rag_formatted entries
+    faqs_root = data.get("faqs", {}) or {}
     for entry in (faqs_root.get("rag_formatted") or []):
         entry_text = _extract_text_from_rag_entry(entry).lower()
         if tokens_sample & set(entry_text.split()) or any(t in entry_text for t in tokens_sample):
-            # keep only question+short answer preview
             preview = entry_text.replace("\n", " ").strip()[:600]
             snippets.append(f"FAQ: {preview}")
 
-    # plain FAQ pairs
     for entry in (faqs_root.get("plain") or faqs_root.get("qa") or []):
         q = entry.get("q") or entry.get("question") or ""
         a = entry.get("a") or entry.get("answer") or ""
@@ -125,7 +98,6 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
         if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
             snippets.append(f"FAQ: Q: {q} A: {a}")
 
-    # search sales_material if present
     sm = data.get("sales_material", {}) or {}
     hero = sm.get("hero_headline","")
     pitch = sm.get("elevator_pitch","")
@@ -144,7 +116,6 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
         if len(out) >= max_chunks:
             break
 
-    # fallback to company summary if nothing found
     if not out:
         company = data.get("company", {}) or {}
         summary = company.get("short_bio") or company.get("about") or company.get("business_activity") or ""
@@ -153,13 +124,11 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
 
     return out
 
-# company-info intent detection (Hindi/English keywords)
 COMPANY_INFO_RE = re.compile(
     r"\b(kab|kab shuru|founder|owner|who founded|owner kaun|establish|incorporat|cin|employees|kitne employees|headquarter|hq|where located|incorporation|founded)\b",
     re.I
 )
 
-# base system persona (English-first; Hinglish optional)
 BASE_PERSONA = (
     "You are Fynorra AI Assistant — the official AI representative of Fynorra AI Solutions. "
     "Tone: professional, concise, helpful, sales-aware but not pushy. "
@@ -178,48 +147,38 @@ BASE_PERSONA = (
 
 @router.post("/chat")
 async def chat_endpoint(request: Request):
-    """
-    Chat endpoint (site-only, text-only).
-    Expects JSON body: {"message":"...", "session_id":"..."}
-    Multipart/form uploads are rejected.
-    """
     ct = request.headers.get("content-type", "")
     message_text, session_id = "", None
 
-    # Reject multipart uploads on site version
     if "multipart/form-data" in ct:
         raise HTTPException(status_code=400, detail="File uploads are disabled on this deployment. Use demo project for file uploads.")
 
-    # Parse JSON payload
     body = await request.json()
     message_text = (body.get("message") or body.get("text") or "").strip()
     session_id = body.get("session_id") or None
 
-    # Ensure conversation
     conv = db.upsert_conversation(session_id)
     conversation_id, session_id = conv["id"], conv["session_id"]
 
-    # Save user message
     db.save_message(conversation_id, role="user", text=message_text, file_url=None)
 
-    # check recent history and whether assistant has greeted
     recent_history = db.get_last_messages(conversation_id, limit=20) or []
     assistant_has_greeted = any(m.get("role") == "assistant" and "Namaste" in (m.get("text") or "") for m in recent_history)
 
-    # LANGUAGE: detect explicit Hindi/Hinglish request
     use_hinglish = False
     if re.search(r"\b(hindi|hinglish|हिंदी|हिंग्लिश|bol in hindi|bol hindi|हेलो हिंदी)\b", message_text, re.I):
         use_hinglish = True
 
-    # Branching intro: if user just greeted, ask quick preference (overview vs needs)
+    # ---------------------------
+    # Improved greeting / branching logic
+    # ---------------------------
     def is_short_greeting(txt: str) -> bool:
         if not txt:
             return False
         t = txt.lower().strip()
-        greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening"]
+        greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening", "hello ji", "hello ji!"]
         if any(t == g or t.startswith(g + " ") or t.endswith(" " + g) for g in greetings):
-            # treat as greeting only if very short (<=3 words)
-            if len(t.split()) <= 3:
+            if len(t.split()) <= 4:
                 return True
         return False
 
@@ -241,17 +200,22 @@ async def chat_endpoint(request: Request):
             return "DEMO"
         return "UNKNOWN"
 
-    if is_short_greeting(message_text) and not assistant_asked_choice(recent_history):
+    # 1) FIRST short greeting (assistant not greeted) -> short natural reply only
+    if is_short_greeting(message_text) and not assistant_has_greeted and not assistant_asked_choice(recent_history):
+        short_greeting = "Hey 👋 — I’m Fynorra AI. How can I assist you today?"
+        db.save_message(conversation_id, role="assistant", text=short_greeting, file_url=None)
+        return JSONResponse({"reply": short_greeting, "session_id": session_id, "is_lead": False, "lead": None})
+
+    # 2) If user greets again after assistant greeted -> show choice prompt
+    if is_short_greeting(message_text) and assistant_has_greeted and not assistant_asked_choice(recent_history):
         choice_prompt = (
-            "Hey 👋 — nice to connect! Would you like a quick **overview of our services** "
-            "or should I ask a couple of questions about your business needs so I can recommend the best solution? "
-            "Reply with 'Overview' or 'Needs' (or just say 'Demo' to schedule a call)."
+            "Hey again 👋 — would you like a quick **overview of our services** or should I ask a couple of questions about your business needs? "
+            "Reply with 'Overview' or 'Needs' (or say 'Demo' to schedule a call)."
         )
-        if not assistant_has_greeted:
-            choice_prompt = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n" + choice_prompt
         db.save_message(conversation_id, role="assistant", text=choice_prompt, file_url=None)
         return JSONResponse({"reply": choice_prompt, "session_id": session_id, "is_lead": False, "lead": None})
 
+    # 3) If assistant previously asked the choice, interpret reply and branch
     if assistant_asked_choice(recent_history):
         intent = interpret_choice_reply(message_text)
         if intent == "SERVICES":
@@ -301,7 +265,6 @@ async def chat_endpoint(request: Request):
         logger.debug("Vector search failed: %s", e)
         hits = []
 
-    # Fallback retrieval / company profile handling
     if not sources_parts or COMPANY_INFO_RE.search(message_text):
         try:
             cp = None
@@ -328,25 +291,18 @@ async def chat_endpoint(request: Request):
             logger.exception("Fallback retrieval error: %s", e)
 
     sources_text = ("\n\n--- SOURCE ---\n\n".join(sources_parts)).strip() if sources_parts else ""
-
-    # build history context (short)
     history = recent_history[:6] if recent_history else []
     history_text = "\n".join([f"{m['role']}: {m['text']}" for m in history]) if history else ""
-
-    # Compose system prompt with language preference
     lang_pref = "Prefer English in responses. Switch to Hinglish only if user asks." if not use_hinglish else "Use Hinglish for responses."
     system_prompt = BASE_PERSONA + "\n" + lang_pref
-
-    # Build final context: sources first (priority), then history
     final_context = "\n".join([sources_text, history_text]).strip() if (sources_text or history_text) else sources_text or history_text
 
-    # LLM call
     try:
         reply = llm_handler.get_llm_response(
             system_prompt=system_prompt,
             context=final_context,
             user_question=message_text,
-            model=os.environ.get("LLM_MODEL", None),  # optional override
+            model=os.environ.get("LLM_MODEL", None),
             request_type="chat",
         )
     except Exception as e:
@@ -356,17 +312,12 @@ async def chat_endpoint(request: Request):
 
     # Prepend canonical greeting once if not present and assistant hasn't greeted
     greeting = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n"
-    # only prepend greeting if assistant hasn't greeted AND reply doesn't already look like a greeting/choice
     if not assistant_has_greeted and not re.search(r"\b(namaste|nice to connect|would you like|overview|how can i help|reply with|'overview'|'needs')\b", (reply or "").lower()):
         reply = greeting + reply
 
-    # Save assistant reply
     db.save_message(conversation_id, role="assistant", text=reply, file_url=None)
 
-    # ---------------------------
-    # Safer Lead detection (weighted + contact detection)
-    # ---------------------------
-
+    # Lead detection (unchanged)
     def extract_contact(text: str):
         email_re = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
         phone_re = r"(\+?\d[\d\s\-\(\)]{6,}\d)"
@@ -393,14 +344,12 @@ async def chat_endpoint(request: Request):
     score_message = compute_interest_score(message_text)
     score_combined = compute_interest_score(combined_text)
 
-    # boost if contact info present
     if contact_email_present or contact_phone_present:
         score_combined = max(score_combined, 0.98)
 
     LEAD_THRESHOLD = float(os.environ.get("LEAD_THRESHOLD", 0.75))
     is_lead = score_combined >= LEAD_THRESHOLD
 
-    # extra guard: don't treat short generic info questions as leads
     if not is_lead:
         words = (message_text or "").strip().split()
         if len(words) < 6 and any(qw in (message_text or "").lower() for qw in ["what", "who", "how", "tell", "batao", "kya"]):
