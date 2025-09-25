@@ -4,78 +4,77 @@ from fastapi.responses import JSONResponse
 import os
 import re
 import json
+import logging
 from pathlib import Path
 from typing import List
 
 from ..services import llm_handler, db
 
 router = APIRouter()
+logger = logging.getLogger("rag_router")
 
-# ---- simple local retrieval helpers ----
-CONTEXT_PATH = Path("context/fynorra_master.json")
+# Local RAG master context path (fallback)
+CONTEXT_PATH = Path("context/fynorra_master_with_faqs")
 
 def load_master_context() -> dict:
     if not CONTEXT_PATH.exists():
         return {}
-    with open(CONTEXT_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CONTEXT_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.exception("Failed to load master context: %s", e)
+        return {}
 
 def text_tokens_preview(text: str, n: int = 50) -> str:
     return (" ".join((text or "").split()[:n])).strip()
 
 def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
-    """
-    Heuristic retriever:
-    - Searches core_services (by name/description), faqs, sales_material, products
-    - Returns up to max_chunks text snippets joined as sources_text
-    """
     data = load_master_context()
     if not data:
         return []
 
     text_l = (text or "").lower()
     if not text_l:
-        # fallback: return company short bio / about
         company = data.get("company", {})
         summary = company.get("short_bio") or company.get("about") or ""
         return [f"Company summary: {summary}"] if summary else []
 
     tokens = text_l.split()
     tokens_sample = set(tokens[:8])
-
     snippets = []
 
-    # search core_services
+    # core_services search
     for svc_group in data.get("core_services", []):
         for svc in svc_group.get("services", []):
             name = svc.get("name", "")
             desc = svc.get("description", "")
             combined = f"{name} {desc}".lower()
-            # match if any of top tokens appear in combined text OR name tokens appear
             if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
-                short = f"Service: {name} — {desc}"
-                snippets.append(short)
+                snippets.append(f"Service: {name} — {desc}")
 
-    # search faqs
+    # faqs
     for f in data.get("faqs", []):
-        q_a = f.get("q", "") + " " + f.get("a", "")
-        if tokens_sample & set(q_a.lower().split()):
+        q_a = (f.get("q", "") + " " + f.get("a", "")).lower()
+        if tokens_sample & set(q_a.split()):
             snippets.append(f"FAQ: Q: {f.get('q')} A: {f.get('a')}")
 
-    # search products
+    # products
     for p in data.get("products", []):
         name = p.get("name", "")
         desc = p.get("description", "")
         combined = f"{name} {desc}".lower()
         if tokens_sample & set(combined.split()):
-            snippets.append(f"Product: {p.get('name')} — {p.get('description')}")
+            snippets.append(f"Product: {name} — {desc}")
 
-    # include sales_material / elevator pitch as fallback context
+    # sales material fallback
     sm = data.get("sales_material", {})
-    if sm:
-        snippets.append(f"Sales: {sm.get('hero_headline','')} — {sm.get('elevator_pitch','')}")
+    hero = sm.get("hero_headline","")
+    pitch = sm.get("elevator_pitch","")
+    if hero or pitch:
+        snippets.append(f"Sales: {hero} — {pitch}")
 
-    # dedupe & clamp
+    # dedupe and clamp
     seen = set()
     out = []
     for s in snippets:
@@ -85,7 +84,6 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
         if len(out) >= max_chunks:
             break
 
-    # if nothing found, return company summary fallback
     if not out:
         company = data.get("company", {})
         summary = company.get("short_bio") or company.get("about") or ""
@@ -94,9 +92,29 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
 
     return out
 
-# -------------------------
-# Router endpoints
-# -------------------------
+# company-info intent detection (Hindi/English keywords)
+COMPANY_INFO_RE = re.compile(
+    r"\b(kab|kab shuru|founder|owner|who founded|owner kaun|establish|incorporat|cin|employees|kitne employees|headquarter|hq|where located|incorporation|founded)\b",
+    re.I
+)
+
+# base system persona (English-first; Hinglish optional)
+BASE_PERSONA = (
+    "You are Fynorra AI Assistant — the official AI representative of Fynorra AI Solutions. "
+    "Tone: professional, concise, helpful, sales-aware but not pushy. "
+    "Rules:\n"
+    "1) Default language: English. Only switch to Hinglish if the user explicitly requests Hindi/Hinglish. "
+    "2) Greet once per session. Greeting (first reply only) should be:\n"
+    "   'Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?'\n"
+    "   Do not repeat this greeting in subsequent replies.\n"
+    "3) Always ask 1-3 discovery questions before providing final quotes or detailed timelines.\n"
+    "4) When answering factual queries, prefer retrieved documents (service docs or company_profile). If company_profile is unverified, prefix with 'According to public records...'.\n"
+    "5) When recommending a service, include: service name, one-line why, estimated dev cost range, monthly OPEX range, timeline estimate, and a clear CTA.\n"
+    "6) Never invent facts; if data is missing, say 'I don’t have that information right now' and offer human handoff.\n"
+    "7) Emphasize Fynorra's automation-first model (AI agents handle most workflows) unless asked otherwise.\n"
+    "8) End replies with a Direct Action Step (e.g., schedule a discovery call, request docs, or ask for confirmation)."
+)
+
 @router.post("/chat")
 async def chat_endpoint(request: Request):
     """
@@ -116,75 +134,102 @@ async def chat_endpoint(request: Request):
     message_text = body.get("message") or body.get("text") or ""
     session_id = body.get("session_id") or None
 
-    # Ensure conversation (db.upsert_conversation should create or return conv)
+    # Ensure conversation
     conv = db.upsert_conversation(session_id)
     conversation_id, session_id = conv["id"], conv["session_id"]
 
     # Save user message
     db.save_message(conversation_id, role="user", text=message_text, file_url=None)
 
-    # ---------------------------
-    # Local RAG retrieval: build sources_text from context/fynorra_master.json
-    # ---------------------------
+    # check recent history and whether assistant has greeted
+    recent_history = db.get_last_messages(conversation_id, limit=20) or []
+    assistant_has_greeted = any(m.get("role") == "assistant" and "Namaste" in (m.get("text") or "") for m in recent_history)
+
+    # LANGUAGE: detect explicit Hindi/Hinglish request
+    use_hinglish = False
+    if re.search(r"\b(hindi|hinglish|हिंदी|हिंग्लिश|bol in hindi|bol hindi|हेलो हिंदी)\b", message_text, re.I):
+        use_hinglish = True
+
+    # RETRIEVAL: primary = vector DB via db.search_documents (if available), fallback = local master context
+    sources_parts: List[str] = []
     try:
-        # Prefer to search against the immediate message; fallback to recent history
-        history_preview = ""
-        recent_history = db.get_last_messages(conversation_id, limit=6)
-        if recent_history:
-            history_preview = " ".join([m.get("text","") for m in recent_history])
-        search_input = message_text or history_preview or ""
-        chunks = find_relevant_chunks(search_input)
-        if chunks:
-            sources_text = "\n--- SOURCE DOC ---\n" + "\n\n".join(chunks)
+        hits = []
+        if hasattr(db, "search_documents"):
+            hits = db.search_documents(message_text, top_k=4) or []
+        elif hasattr(db, "search_services"):
+            hits = db.search_services(message_text, top_k=4) or []
         else:
-            # fallback: short company summary
-            master = load_master_context()
-            company_summary = master.get("company", {}).get("short_bio") or master.get("company", {}).get("about") or ""
-            sources_text = f"Company summary: {text_tokens_preview(company_summary, 80)}" if company_summary else ""
+            hits = []
+
+        for h in hits:
+            meta_name = (h.get("metadata") or {}).get("service_name") or h.get("id")
+            text = h.get("text") or h.get("snippet") or ""
+            sources_parts.append(f"[VECTOR-HIT] {meta_name}\n{text[:1500]}")
     except Exception as e:
-        print("Context load error:", e)
-        sources_text = ""
+        logger.debug("Vector search failed: %s", e)
+        hits = []
 
-    # Persona / system prompt (unchanged from your provided persona)
-    persona = (
-        "You are Fynorra’s AI Assistant, acting as a friendly consultant and sales guide. "
-        "Always start the first reply in clear English, with a one-time greeting: 'Namaste 🙏, I’m Fynorra Assistant.' "
-        "After greeting, introduce yourself in one line: 'I can help you explore our AI chatbots, automation, cloud, and IT solutions.' "
-        "Do not repeat this greeting in later replies. "
-        "If the user asks to talk in Hinglish (Hindi + English), politely switch to Hinglish for the rest of the session. "
-        "English must always be supported, never refuse it. "
-        "Speak in a professional yet friendly tone — like a consultant who is approachable, not robotic. "
-        "Explain Fynorra’s services concisely: AI Chatbots, Automation & Integrations, Custom Software, Cloud & DevOps, and IT Consulting. "
-        "Use simple language for non-technical users, but provide technical clarity if asked. "
-        "Never invent details — only answer from the provided Fynorra context data. "
-        "If information is missing, reply: 'I don’t have that information right now.' "
-        "When the user shows interest (e.g., asks about pricing, demo, or implementation), "
-        "ask one polite qualifying question (like their business size, industry, or use case), "
-        "then propose a clear next step: booking a demo, requesting a quote, or sharing contact details. "
-        "Always highlight Fynorra’s brand values: 'Elevate Your Digital Vision' and 'Smart. Scalable. Reliable.' "
-        "End conversations with a helpful offer, such as: 'Would you like me to share a quick demo link or connect you with our team?' "
-    )
+    # Fallback to local context if no vector hits or for company-info
+    if not sources_parts or COMPANY_INFO_RE.search(message_text):
+        try:
+            # If user asks company-info, prefer company_profile from DB (fetch_by_id) else local
+            cp = None
+            if hasattr(db, "fetch_by_id"):
+                try:
+                    cp = db.fetch_by_id("company_profile")
+                except Exception:
+                    cp = None
+            if cp and isinstance(cp, dict):
+                cp_text = (cp.get("metadata") or {}).get("text") or cp.get("text") or json.dumps(cp)
+                verified = (cp.get("metadata") or {}).get("verified", False)
+                prefix = "" if verified else "(According to public records) "
+                sources_parts.insert(0, f"[COMPANY_PROFILE] {prefix}{cp_text[:1200]}")
+            else:
+                # local master fallback
+                chunks = find_relevant_chunks(message_text)
+                for c in chunks:
+                    sources_parts.append(f"[LOCAL] {c}")
+                # If nothing at all, include short company bio
+                if not sources_parts:
+                    master = load_master_context()
+                    company_summary = master.get("company", {}).get("short_bio") or master.get("company", {}).get("about") or ""
+                    if company_summary:
+                        sources_parts.append(f"[LOCAL] Company summary: {text_tokens_preview(company_summary, 120)}")
+        except Exception as e:
+            logger.exception("Fallback retrieval error: %s", e)
 
-    # Conversation history (last few messages for context)
-    history = recent_history or db.get_last_messages(conversation_id, limit=6)
+    sources_text = ("\n\n--- SOURCE ---\n\n".join(sources_parts)).strip() if sources_parts else ""
+
+    # build history context (short)
+    history = recent_history[:6] if recent_history else []
     history_text = "\n".join([f"{m['role']}: {m['text']}" for m in history]) if history else ""
 
-    # Build final context: include source doc snippets + recent history
-    context = (sources_text + "\n" + history_text).strip() if (sources_text or history_text) else sources_text
+    # Compose system prompt with language preference
+    lang_pref = "Prefer English in responses. Switch to Hinglish only if user asks." if not use_hinglish else "Use Hinglish for responses."
+    system_prompt = BASE_PERSONA + "\n" + lang_pref
+
+    # Build final context: sources first (priority), then history
+    final_context = "\n".join([sources_text, history_text]).strip() if (sources_text or history_text) else sources_text or history_text
 
     # LLM call
     try:
         reply = llm_handler.get_llm_response(
-            system_prompt=persona,
-            context=context,
+            system_prompt=system_prompt,
+            context=final_context,
             user_question=message_text,
-            model=os.environ.get("LLM_MODEL", None),  # optional override; llm_handler has its own default
+            model=os.environ.get("LLM_MODEL", None),  # optional override
             request_type="chat",
         )
     except Exception as e:
-        print("LLM error (full):", repr(e))
+        logger.exception("LLM error (full): %s", e)
         msg = str(e)
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {msg[:500]}")
+
+    # Prepend canonical greeting once if not present and assistant hasn't greeted
+    if not assistant_has_greeted and "Namaste" not in (reply or ""):
+        # add English-first greeting (per new rule)
+        greeting = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n"
+        reply = greeting + reply
 
     # Save assistant reply
     db.save_message(conversation_id, role="assistant", text=reply, file_url=None)
@@ -198,7 +243,6 @@ async def chat_endpoint(request: Request):
         phone_re = r"(\+?\d[\d\s\-\(\)]{6,}\d)"
         return bool(re.search(email_re, text)), bool(re.search(phone_re, text))
 
-    # higher weight = stronger buying intent
     KEYWORD_WEIGHTS = {
         r"\b(demo|schedule demo|book demo)\b": 0.95,
         r"\b(price|pricing|cost|quote)\b": 0.85,
@@ -225,7 +269,6 @@ async def chat_endpoint(request: Request):
         score_combined = max(score_combined, 0.98)
 
     LEAD_THRESHOLD = float(os.environ.get("LEAD_THRESHOLD", 0.75))
-
     is_lead = score_combined >= LEAD_THRESHOLD
 
     # extra guard: don't treat short generic info questions as leads
@@ -245,7 +288,7 @@ async def chat_endpoint(request: Request):
         try:
             db.notify_sales(lead)
         except Exception as e:
-            print("Notify sales failed:", e)
+            logger.exception("Notify sales failed: %s", e)
 
     return JSONResponse({
         "reply": reply,
