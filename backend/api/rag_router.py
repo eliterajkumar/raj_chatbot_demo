@@ -13,68 +13,128 @@ from ..services import llm_handler, db
 router = APIRouter()
 logger = logging.getLogger("rag_router")
 
-# Local RAG master context path (fallback)
-CONTEXT_PATH = Path("context/fynorra_master_with_faqs")
+# Local RAG master context path (fallback) — ensure .json file
+CONTEXT_PATH = Path("context/fynorra_master_with_faqs.json")
 
 def load_master_context() -> dict:
-    if not CONTEXT_PATH.exists():
-        return {}
-    try:
-        with open(CONTEXT_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.exception("Failed to load master context: %s", e)
-        return {}
+    """
+    Load the master JSON context. Try a few likely paths for robustness.
+    """
+    candidates = [CONTEXT_PATH, Path("context/fynorra_master_with_faqs"), Path("context/fynorra_master_combined.json"),
+                  Path("/mnt/data/fynorra_master_with_faqs.json"), Path("/mnt/data/fynorra_master_combined.json")]
+    for p in candidates:
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # Normalize common shapes: prefer top-level 'company' or 'company_profile'
+                    if "company_profile" in data and "company" not in data:
+                        data["company"] = data.get("company_profile")
+                    # if services under top-level 'services' keep as-is; older shape 'core_services' may exist
+                    if "core_services" in data and "services" not in data:
+                        # try to flatten core_services into services list
+                        svc_list = []
+                        for grp in data.get("core_services", []):
+                            for s in grp.get("services", []):
+                                svc_list.append(s)
+                        data["services"] = svc_list
+                    return data
+        except Exception as e:
+            logger.exception("Failed to load master context from %s: %s", p, e)
+    return {}
 
 def text_tokens_preview(text: str, n: int = 50) -> str:
     return (" ".join((text or "").split()[:n])).strip()
 
+def _extract_text_from_rag_entry(entry) -> str:
+    """
+    Given a RAG-style entry (dict or string), extract readable text for matching.
+    """
+    if not entry:
+        return ""
+    if isinstance(entry, str):
+        return entry
+    # expected formats: {"text": "...", "metadata": {...}} or {"messages": [...]}
+    if isinstance(entry, dict):
+        if "text" in entry:
+            return entry.get("text", "")
+        if "messages" in entry:
+            # join user+assistant pairs
+            msgs = entry.get("messages", [])
+            return " ".join([m.get("content", "") for m in msgs if isinstance(m, dict)])
+        # fallback: stringify
+        return json.dumps(entry, ensure_ascii=False)
+    return str(entry)
+
 def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
+    """
+    Heuristic retriever:
+    - Searches 'services' (by name/short_description), 'faqs' (rag_formatted), and 'sales_material' if present.
+    - Returns up to max_chunks text snippets joined as sources_text.
+    """
     data = load_master_context()
     if not data:
         return []
 
     text_l = (text or "").lower()
     if not text_l:
-        company = data.get("company", {})
-        summary = company.get("short_bio") or company.get("about") or ""
+        company = data.get("company", {}) or {}
+        summary = company.get("short_bio") or company.get("about") or company.get("business_activity") or ""
         return [f"Company summary: {summary}"] if summary else []
 
     tokens = text_l.split()
     tokens_sample = set(tokens[:8])
     snippets = []
 
-    # core_services search
-    for svc_group in data.get("core_services", []):
-        for svc in svc_group.get("services", []):
+    # Search services array (each service is a dict as we created earlier)
+    for svc in data.get("services", []):
+        # support both flat service dict or grouped structure
+        name = svc.get("service_name") or svc.get("name") or svc.get("service_id") or ""
+        desc = svc.get("short_description") or svc.get("description") or svc.get("sales_pitch") or ""
+        combined = f"{name} {desc}".lower()
+        if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
+            short = f"Service: {name} — {desc}"
+            snippets.append(short)
+
+    # Search top-level core_services groups if present (backwards compatibility)
+    for grp in data.get("core_services", []):
+        for svc in grp.get("services", []):
             name = svc.get("name", "")
             desc = svc.get("description", "")
             combined = f"{name} {desc}".lower()
             if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
                 snippets.append(f"Service: {name} — {desc}")
 
-    # faqs
-    for f in data.get("faqs", []):
-        q_a = (f.get("q", "") + " " + f.get("a", "")).lower()
-        if tokens_sample & set(q_a.split()):
-            snippets.append(f"FAQ: Q: {f.get('q')} A: {f.get('a')}")
+    # Search FAQs: we support two shapes:
+    # 1) data['faqs']['rag_formatted'] -> list of {"text": "...", "metadata": {...}}
+    # 2) data['faqs']['plain'] -> list of {"q": "...", "a":"..."} or simple list of q/a pairs
+    faqs_root = data.get("faqs", {})
+    # rag_formatted entries
+    for entry in (faqs_root.get("rag_formatted") or []):
+        entry_text = _extract_text_from_rag_entry(entry).lower()
+        if tokens_sample & set(entry_text.split()) or any(t in entry_text for t in tokens_sample):
+            # keep only question+short answer preview
+            preview = entry_text.replace("\n", " ").strip()[:600]
+            snippets.append(f"FAQ: {preview}")
 
-    # products
-    for p in data.get("products", []):
-        name = p.get("name", "")
-        desc = p.get("description", "")
-        combined = f"{name} {desc}".lower()
-        if tokens_sample & set(combined.split()):
-            snippets.append(f"Product: {name} — {desc}")
+    # plain FAQ pairs
+    for entry in (faqs_root.get("plain") or faqs_root.get("qa") or []):
+        q = entry.get("q") or entry.get("question") or ""
+        a = entry.get("a") or entry.get("answer") or ""
+        combined = f"{q} {a}".lower()
+        if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
+            snippets.append(f"FAQ: Q: {q} A: {a}")
 
-    # sales material fallback
-    sm = data.get("sales_material", {})
+    # search sales_material if present
+    sm = data.get("sales_material", {}) or {}
     hero = sm.get("hero_headline","")
     pitch = sm.get("elevator_pitch","")
     if hero or pitch:
-        snippets.append(f"Sales: {hero} — {pitch}")
+        combined = f"{hero} {pitch}".lower()
+        if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
+            snippets.append(f"Sales: {hero} — {pitch}")
 
-    # dedupe and clamp
+    # dedupe & clamp
     seen = set()
     out = []
     for s in snippets:
@@ -84,11 +144,12 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
         if len(out) >= max_chunks:
             break
 
+    # fallback to company summary if nothing found
     if not out:
-        company = data.get("company", {})
-        summary = company.get("short_bio") or company.get("about") or ""
+        company = data.get("company", {}) or {}
+        summary = company.get("short_bio") or company.get("about") or company.get("business_activity") or ""
         if summary:
-            out.append(f"Company summary: {summary}")
+            out.append(f"Company summary: {text_tokens_preview(summary, 60)}")
 
     return out
 
@@ -131,7 +192,7 @@ async def chat_endpoint(request: Request):
 
     # Parse JSON payload
     body = await request.json()
-    message_text = body.get("message") or body.get("text") or ""
+    message_text = (body.get("message") or body.get("text") or "").strip()
     session_id = body.get("session_id") or None
 
     # Ensure conversation
@@ -150,7 +211,78 @@ async def chat_endpoint(request: Request):
     if re.search(r"\b(hindi|hinglish|हिंदी|हिंग्लिश|bol in hindi|bol hindi|हेलो हिंदी)\b", message_text, re.I):
         use_hinglish = True
 
-    # RETRIEVAL: primary = vector DB via db.search_documents (if available), fallback = local master context
+    # Branching intro: if user just greeted, ask quick preference (overview vs needs)
+    def is_short_greeting(txt: str) -> bool:
+        if not txt:
+            return False
+        t = txt.lower().strip()
+        greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening"]
+        if any(t == g or t.startswith(g + " ") or t.endswith(" " + g) for g in greetings):
+            # treat as greeting only if very short (<=3 words)
+            if len(t.split()) <= 3:
+                return True
+        return False
+
+    def assistant_asked_choice(history) -> bool:
+        for m in reversed(history):
+            if m.get("role") == "assistant":
+                txt = (m.get("text") or "").lower()
+                if "would you like" in txt and ("overview" in txt or "talk about your business needs" in txt or "reply with 'overview' or 'needs'" in txt):
+                    return True
+        return False
+
+    def interpret_choice_reply(txt: str) -> str:
+        t = (txt or "").lower()
+        if any(w in t for w in ["service", "services", "overview", "explain", "what do you offer", "show me"]):
+            return "SERVICES"
+        if any(w in t for w in ["need", "automate", "problem", "project", "help", "use case", "business", "we want"]):
+            return "NEEDS"
+        if any(w in t for w in ["demo", "call", "schedule", "meeting"]):
+            return "DEMO"
+        return "UNKNOWN"
+
+    if is_short_greeting(message_text) and not assistant_asked_choice(recent_history):
+        choice_prompt = (
+            "Hey 👋 — nice to connect! Would you like a quick **overview of our services** "
+            "or should I ask a couple of questions about your business needs so I can recommend the best solution? "
+            "Reply with 'Overview' or 'Needs' (or just say 'Demo' to schedule a call)."
+        )
+        if not assistant_has_greeted:
+            choice_prompt = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n" + choice_prompt
+        db.save_message(conversation_id, role="assistant", text=choice_prompt, file_url=None)
+        return JSONResponse({"reply": choice_prompt, "session_id": session_id, "is_lead": False, "lead": None})
+
+    if assistant_asked_choice(recent_history):
+        intent = interpret_choice_reply(message_text)
+        if intent == "SERVICES":
+            services_overview = (
+                "We provide: AI Chatbots (website & WhatsApp), RAG-based assistants, Document OCR & Automation, "
+                "CRM integrations, AI Content Pipelines, Voice/IVR, Dashboards & Predictive Analytics, and Custom Copilots. "
+                "Which of these interests you most — or shall I suggest based on your industry?"
+            )
+            db.save_message(conversation_id, role="assistant", text=services_overview, file_url=None)
+            return JSONResponse({"reply": services_overview, "session_id": session_id, "is_lead": False, "lead": None})
+        if intent == "NEEDS":
+            discovery = (
+                "Great — to recommend the right solution I need a couple quick details:\n"
+                "1) What primary business process or challenge are you looking to automate? \n"
+                "2) Which industry are you in? \n"
+                "3) Do you have a target timeline or budget range?\n\n"
+                "Reply with short answers and I’ll suggest the best option and next step."
+            )
+            db.save_message(conversation_id, role="assistant", text=discovery, file_url=None)
+            return JSONResponse({"reply": discovery, "session_id": session_id, "is_lead": False, "lead": None})
+        if intent == "DEMO":
+            demo_msg = "Sure — I can schedule a 20-min demo. Please share your preferred day/time and contact email/phone, or reply 'Call me' and our team will reach out."
+            db.save_message(conversation_id, role="assistant", text=demo_msg, file_url=None)
+            return JSONResponse({"reply": demo_msg, "session_id": session_id, "is_lead": True, "lead": None})
+        reprompt = "Do you want a quick overview of our services, or shall I ask about your business needs? Reply 'Overview' or 'Needs'."
+        db.save_message(conversation_id, role="assistant", text=reprompt, file_url=None)
+        return JSONResponse({"reply": reprompt, "session_id": session_id, "is_lead": False, "lead": None})
+
+    # -----------------------
+    # Normal flow (retrieval + LLM)
+    # -----------------------
     sources_parts: List[str] = []
     try:
         hits = []
@@ -169,10 +301,9 @@ async def chat_endpoint(request: Request):
         logger.debug("Vector search failed: %s", e)
         hits = []
 
-    # Fallback to local context if no vector hits or for company-info
+    # Fallback retrieval / company profile handling
     if not sources_parts or COMPANY_INFO_RE.search(message_text):
         try:
-            # If user asks company-info, prefer company_profile from DB (fetch_by_id) else local
             cp = None
             if hasattr(db, "fetch_by_id"):
                 try:
@@ -185,11 +316,9 @@ async def chat_endpoint(request: Request):
                 prefix = "" if verified else "(According to public records) "
                 sources_parts.insert(0, f"[COMPANY_PROFILE] {prefix}{cp_text[:1200]}")
             else:
-                # local master fallback
                 chunks = find_relevant_chunks(message_text)
                 for c in chunks:
                     sources_parts.append(f"[LOCAL] {c}")
-                # If nothing at all, include short company bio
                 if not sources_parts:
                     master = load_master_context()
                     company_summary = master.get("company", {}).get("short_bio") or master.get("company", {}).get("about") or ""
