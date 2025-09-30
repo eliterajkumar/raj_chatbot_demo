@@ -16,9 +16,10 @@ logger = logging.getLogger("rag_router")
 # Local RAG master context path (fallback) — ensure .json file
 CONTEXT_PATH = Path("context/fynorra_master_with_faqs.json")
 
+
 def load_master_context() -> dict:
     candidates = [CONTEXT_PATH, Path("context/fynorra_master_with_faqs"), Path("context/fynorra_master_combined.json"),
-                  Path("/mnt/data/fynorra_master_with_faqs.json"), Path("/mnt/data/fynorra_master_combined.json")]
+                  Path("/context/fynorra_master_with_faqs.json"), Path("/context/fynorra_master_combined.json")]
     for p in candidates:
         try:
             if p.exists():
@@ -37,8 +38,10 @@ def load_master_context() -> dict:
             logger.exception("Failed to load master context from %s: %s", p, e)
     return {}
 
+
 def text_tokens_preview(text: str, n: int = 50) -> str:
     return (" ".join((text or "").split()[:n])).strip()
+
 
 def _extract_text_from_rag_entry(entry) -> str:
     if not entry:
@@ -53,6 +56,7 @@ def _extract_text_from_rag_entry(entry) -> str:
             return " ".join([m.get("content", "") for m in msgs if isinstance(m, dict)])
         return json.dumps(entry, ensure_ascii=False)
     return str(entry)
+
 
 def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
     data = load_master_context()
@@ -99,8 +103,8 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
             snippets.append(f"FAQ: Q: {q} A: {a}")
 
     sm = data.get("sales_material", {}) or {}
-    hero = sm.get("hero_headline","")
-    pitch = sm.get("elevator_pitch","")
+    hero = sm.get("hero_headline", "")
+    pitch = sm.get("elevator_pitch", "")
     if hero or pitch:
         combined = f"{hero} {pitch}".lower()
         if tokens_sample & set(combined.split()) or any(t in combined for t in tokens_sample):
@@ -124,26 +128,74 @@ def find_relevant_chunks(text: str, max_chunks: int = 3) -> List[str]:
 
     return out
 
+
+# COMPANY_INFO_RE updated to English (broader)
 COMPANY_INFO_RE = re.compile(
-    r"\b(kab|kab shuru|founder|owner|who founded|owner kaun|establish|incorporat|cin|employees|kitne employees|headquarter|hq|where located|incorporation|founded)\b",
-    re.I
+    r"\b(?:"
+    r"founder|founders|who founded|who is the founder|owner|owners|"
+    r"when (?:was|were) (?:the )?(?:company|you) (?:founded|established)|founded in|established in|"
+    r"incorporat(?:ed|ion)?|inc\b|ltd\b|llc\b|pvt(?:\.?\s*ltd)?|registered (?:in|under)|registration number|"
+    r"company (?:number|no\.?)|CIN|company identification number|address|location|"
+    r"headquarter(?:s)?|headquartered|hq\b|where (?:is|are) (?:the )?(?:company|you) (?:located|based)|"
+    r"employees|staff|team size|number of employees"
+    r")\b",
+    re.I,
 )
 
+
+# Persona: tighten instruction to LLM to answer directly without prefaces.
 BASE_PERSONA = (
     "You are Fynorra AI Assistant — the official AI representative of Fynorra AI Solutions. "
-    "Tone: professional, concise, helpful, sales-aware but not pushy. "
+    "Tone: professional, concise, factual, and helpful. Answer directly to the user's question and do NOT add additional greetings, lead-ins or marketing 'feed' text. "
+    "If the user message is a greeting (hi/hello), reply with a one-line greeting only. For all other queries, produce a direct, short answer (1-3 sentences) strictly based on provided company context. "
     "Rules:\n"
-    "1) Default language: English. Only switch to Hinglish if the user explicitly requests Hindi/Hinglish. "
-    "2) Greet once per session. Greeting (first reply only) should be:\n"
-    "   'Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?'\n"
-    "   Do not repeat this greeting in subsequent replies.\n"
-    "3) Always ask 1-3 discovery questions before providing final quotes or detailed timelines.\n"
-    "4) When answering factual queries, prefer retrieved documents (service docs or company_profile). If company_profile is unverified, prefix with 'According to public records...'.\n"
-    "5) When recommending a service, include: service name, one-line why, estimated dev cost range, monthly OPEX range, timeline estimate, and a clear CTA.\n"
-    "6) Never invent facts; if data is missing, say 'I don’t have that information right now' and offer human handoff.\n"
-    "7) Emphasize Fynorra's automation-first model (AI agents handle most workflows) unless asked otherwise.\n"
-    "8) End replies with a Direct Action Step (e.g., schedule a discovery call, request docs, or ask for confirmation)."
+    "1) Default language: English. Only switch to Hinglish if the user explicitly requests it.\n"
+    "2) Do not invent facts. If info is missing, say: 'I don't have that information right now; would you like me to connect you with our team?'.\n"
+    "3) When asked about services, list matching services only (1-line each), no extra marketing blurbs.\n"
+    "4) End with a clear Direct Action Step (single sentence) only when it is helpful (e.g., 'Reply \"Demo\" to schedule a 20-min demo').\n"
 )
+
+
+def _is_short_greeting(txt: str) -> bool:
+    if not txt:
+        return False
+    t = txt.lower().strip()
+    greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening", "hello ji", "namaste", "namaste ji"]
+    if any(t == g or t.startswith(g + " ") or t.endswith(" " + g) for g in greetings):
+        if len(t.split()) <= 4:
+            return True
+    return False
+
+
+def _clean_reply(reply: str, user_message: str, allow_greeting: bool) -> str:
+    """
+    Post-process LLM reply:
+     - If user didn't send a greeting, remove leading common greetings from reply.
+     - Strip repeated assistant feed-like sentences such as 'How can I help you today?' at top.
+     - Ensure reply is concise (trim long repetitive leading paragraphs).
+    """
+    if not reply:
+        return reply or ""
+
+    r = reply.strip()
+
+    # remove leading greetings unless we explicitly allow greeting
+    if not allow_greeting:
+        # common greeting starters to strip
+        r = re.sub(r'^\s*(namaste[^\n]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r'^\s*(hi[^\n]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r'^\s*(hello[^\n]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r'^\s*(hey[^\n]*[\n]*)', '', r, flags=re.I)
+
+        # remove stock lead-ins like "How can I help you today?" if at start
+        r = re.sub(r'^\s*(how can i (help|assist) you (today)?[.?!]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r'^\s*(how may I help you[.?!]*[\n]*)', '', r, flags=re.I)
+
+    # trim excessive whitespace and repeated newlines
+    r = re.sub(r'\n{3,}', '\n\n', r).strip()
+
+    return r
+
 
 @router.post("/chat")
 async def chat_endpoint(request: Request):
@@ -163,25 +215,22 @@ async def chat_endpoint(request: Request):
     db.save_message(conversation_id, role="user", text=message_text, file_url=None)
 
     recent_history = db.get_last_messages(conversation_id, limit=20) or []
-    assistant_has_greeted = any(m.get("role") == "assistant" and "Namaste" in (m.get("text") or "") for m in recent_history)
+    assistant_has_greeted = any(m.get("role") == "assistant" and re.search(r"\b(namaste|hi|hello)\b", (m.get("text") or ""), re.I) for m in recent_history)
 
     use_hinglish = False
     if re.search(r"\b(hindi|hinglish|हिंदी|हिंग्लिश|bol in hindi|bol hindi|हेलो हिंदी)\b", message_text, re.I):
         use_hinglish = True
 
     # ---------------------------
-    # Improved greeting / branching logic
+    # Greeting / choice logic (kept, but now explicit and minimal)
     # ---------------------------
-    def is_short_greeting(txt: str) -> bool:
-        if not txt:
-            return False
-        t = txt.lower().strip()
-        greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening", "hello ji", "hello ji!"]
-        if any(t == g or t.startswith(g + " ") or t.endswith(" " + g) for g in greetings):
-            if len(t.split()) <= 4:
-                return True
-        return False
+    # 1) If user sends a short greeting and assistant hasn't greeted -> reply with one-line greeting only
+    if _is_short_greeting(message_text) and not assistant_has_greeted:
+        short_greeting = "Namaste 🙏 — I’m Fynorra AI — your AI automation partner."
+        db.save_message(conversation_id, role="assistant", text=short_greeting, file_url=None)
+        return JSONResponse({"reply": short_greeting, "session_id": session_id, "is_lead": False, "lead": None})
 
+    # 2) If assistant earlier asked a choice, branch (keeps behavior)
     def assistant_asked_choice(history) -> bool:
         for m in reversed(history):
             if m.get("role") == "assistant":
@@ -200,52 +249,35 @@ async def chat_endpoint(request: Request):
             return "DEMO"
         return "UNKNOWN"
 
-    # 1) FIRST short greeting (assistant not greeted) -> short natural reply only
-    if is_short_greeting(message_text) and not assistant_has_greeted and not assistant_asked_choice(recent_history):
-        short_greeting = "Hey 👋 — I’m Fynorra AI. How can I assist you today?"
-        db.save_message(conversation_id, role="assistant", text=short_greeting, file_url=None)
-        return JSONResponse({"reply": short_greeting, "session_id": session_id, "is_lead": False, "lead": None})
-
-    # 2) If user greets again after assistant greeted -> show choice prompt
-    if is_short_greeting(message_text) and assistant_has_greeted and not assistant_asked_choice(recent_history):
-        choice_prompt = (
-            "Hey again 👋 — would you like a quick **overview of our services** or should I ask a couple of questions about your business needs? "
-            "Reply with 'Overview' or 'Needs' (or say 'Demo' to schedule a call)."
-        )
-        db.save_message(conversation_id, role="assistant", text=choice_prompt, file_url=None)
-        return JSONResponse({"reply": choice_prompt, "session_id": session_id, "is_lead": False, "lead": None})
-
-    # 3) If assistant previously asked the choice, interpret reply and branch
     if assistant_asked_choice(recent_history):
         intent = interpret_choice_reply(message_text)
         if intent == "SERVICES":
             services_overview = (
-                "We provide: AI Chatbots (website & WhatsApp), RAG-based assistants, Document OCR & Automation, "
-                "CRM integrations, AI Content Pipelines, Voice/IVR, Dashboards & Predictive Analytics, and Custom Copilots. "
-                "Which of these interests you most — or shall I suggest based on your industry?"
+                "AI Chatbots (Website & WhatsApp): conversational assistants for FAQs & lead capture.\n"
+                "RAG Assistants: document-backed Q&A for product & policy docs.\n"
+                "Document OCR & Automation: extract data and automate workflows.\n"
+                "CRM & Integrations: sync leads, tickets, and workflows.\n"
+                "Dashboards & Analytics: insights and predictive metrics.\n"
+                "Reply with the service name you'd like details on, or 'Demo' to schedule a call."
             )
             db.save_message(conversation_id, role="assistant", text=services_overview, file_url=None)
             return JSONResponse({"reply": services_overview, "session_id": session_id, "is_lead": False, "lead": None})
         if intent == "NEEDS":
             discovery = (
-                "Great — to recommend the right solution I need a couple quick details:\n"
-                "1) What primary business process or challenge are you looking to automate? \n"
-                "2) Which industry are you in? \n"
-                "3) Do you have a target timeline or budget range?\n\n"
-                "Reply with short answers and I’ll suggest the best option and next step."
+                "To suggest the right solution, please share: (1) the process you want to automate, (2) your industry, and (3) rough timeline/budget."
             )
             db.save_message(conversation_id, role="assistant", text=discovery, file_url=None)
             return JSONResponse({"reply": discovery, "session_id": session_id, "is_lead": False, "lead": None})
         if intent == "DEMO":
-            demo_msg = "Sure — I can schedule a 20-min demo. Please share your preferred day/time and contact email/phone, or reply 'Call me' and our team will reach out."
+            demo_msg = "Sure — to schedule a 20-min demo, please share a preferred date/time and contact email/phone."
             db.save_message(conversation_id, role="assistant", text=demo_msg, file_url=None)
             return JSONResponse({"reply": demo_msg, "session_id": session_id, "is_lead": True, "lead": None})
-        reprompt = "Do you want a quick overview of our services, or shall I ask about your business needs? Reply 'Overview' or 'Needs'."
+        reprompt = "Reply 'Overview' or 'Needs' — I can give a short overview of services or ask a few questions about your needs."
         db.save_message(conversation_id, role="assistant", text=reprompt, file_url=None)
         return JSONResponse({"reply": reprompt, "session_id": session_id, "is_lead": False, "lead": None})
 
     # -----------------------
-    # Normal flow (retrieval + LLM)
+    # Normal flow (retrieval + LLM) — build concise context
     # -----------------------
     sources_parts: List[str] = []
     try:
@@ -258,13 +290,14 @@ async def chat_endpoint(request: Request):
             hits = []
 
         for h in hits:
-            meta_name = (h.get("metadata") or {}).get("service_name") or h.get("id")
+            meta_name = (h.get("metadata") or {}).get("service_name") or h.get("id") or h.get("metadata", {}).get("title")
             text = h.get("text") or h.get("snippet") or ""
             sources_parts.append(f"[VECTOR-HIT] {meta_name}\n{text[:1500]}")
     except Exception as e:
         logger.debug("Vector search failed: %s", e)
         hits = []
 
+    # If no vector hits or the question is about company identity, use local master context
     if not sources_parts or COMPANY_INFO_RE.search(message_text):
         try:
             cp = None
@@ -291,86 +324,10 @@ async def chat_endpoint(request: Request):
             logger.exception("Fallback retrieval error: %s", e)
 
     sources_text = ("\n\n--- SOURCE ---\n\n".join(sources_parts)).strip() if sources_parts else ""
-    history = recent_history[:6] if recent_history else []
+    history = recent_history[-6:] if recent_history else []
+    # include only minimal recent history (role + text) to preserve context but avoid feed repetition
     history_text = "\n".join([f"{m['role']}: {m['text']}" for m in history]) if history else ""
     lang_pref = "Prefer English in responses. Switch to Hinglish only if user asks." if not use_hinglish else "Use Hinglish for responses."
     system_prompt = BASE_PERSONA + "\n" + lang_pref
-    final_context = "\n".join([sources_text, history_text]).strip() if (sources_text or history_text) else sources_text or history_text
 
-    try:
-        reply = llm_handler.get_llm_response(
-            system_prompt=system_prompt,
-            context=final_context,
-            user_question=message_text,
-            model=os.environ.get("LLM_MODEL", None),
-            request_type="chat",
-        )
-    except Exception as e:
-        logger.exception("LLM error (full): %s", e)
-        msg = str(e)
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {msg[:500]}")
-
-    # Prepend canonical greeting once if not present and assistant hasn't greeted
-    greeting = "Namaste 🙏, I’m Fynorra AI — your AI automation partner. How can I help you today?\n\n"
-    if not assistant_has_greeted and not re.search(r"\b(namaste|nice to connect|would you like|overview|how can i help|reply with|'overview'|'needs')\b", (reply or "").lower()):
-        reply = greeting + reply
-
-    db.save_message(conversation_id, role="assistant", text=reply, file_url=None)
-
-    # Lead detection (unchanged)
-    def extract_contact(text: str):
-        email_re = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-        phone_re = r"(\+?\d[\d\s\-\(\)]{6,}\d)"
-        return bool(re.search(email_re, text)), bool(re.search(phone_re, text))
-
-    KEYWORD_WEIGHTS = {
-        r"\b(demo|schedule demo|book demo)\b": 0.95,
-        r"\b(price|pricing|cost|quote)\b": 0.85,
-        r"\b(interested|want to buy|purchase|signup|sign up|get started)\b": 0.75,
-        r"\b(contact|call me|reach out|connect)\b": 0.65,
-        r"\b(schedule|meeting|request demo)\b": 0.8,
-    }
-
-    def compute_interest_score(text: str):
-        score = 0.0
-        txt = (text or "").lower()
-        for kw_re, w in KEYWORD_WEIGHTS.items():
-            if re.search(kw_re, txt):
-                score = max(score, w)
-        return score
-
-    combined_text = (message_text or "") + " " + (reply or "")
-    contact_email_present, contact_phone_present = extract_contact(combined_text)
-    score_message = compute_interest_score(message_text)
-    score_combined = compute_interest_score(combined_text)
-
-    if contact_email_present or contact_phone_present:
-        score_combined = max(score_combined, 0.98)
-
-    LEAD_THRESHOLD = float(os.environ.get("LEAD_THRESHOLD", 0.75))
-    is_lead = score_combined >= LEAD_THRESHOLD
-
-    if not is_lead:
-        words = (message_text or "").strip().split()
-        if len(words) < 6 and any(qw in (message_text or "").lower() for qw in ["what", "who", "how", "tell", "batao", "kya"]):
-            is_lead = False
-
-    lead = None
-    if is_lead:
-        lead = db.create_lead(
-            conversation_id,
-            snippet=(message_text or "")[:500],
-            score=float(score_combined),
-            metadata={"detected_contact": contact_email_present or contact_phone_present}
-        )
-        try:
-            db.notify_sales(lead)
-        except Exception as e:
-            logger.exception("Notify sales failed: %s", e)
-
-    return JSONResponse({
-        "reply": reply,
-        "session_id": session_id,
-        "is_lead": is_lead,
-        "lead": lead
-    })
+    # final_context: keep short, only sou_
