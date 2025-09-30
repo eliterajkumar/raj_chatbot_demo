@@ -5,6 +5,7 @@ import os
 import re
 import json
 import logging
+import time
 from pathlib import Path
 from typing import List
 
@@ -18,8 +19,13 @@ CONTEXT_PATH = Path("context/fynorra_master_with_faqs.json")
 
 
 def load_master_context() -> dict:
-    candidates = [CONTEXT_PATH, Path("context/fynorra_master_with_faqs"), Path("context/fynorra_master_combined.json"),
-                  Path("/context/fynorra_master_with_faqs.json"), Path("/context/fynorra_master_combined.json")]
+    candidates = [
+        CONTEXT_PATH,
+        Path("context/fynorra_master_with_faqs"),
+        Path("context/fynorra_master_combined.json"),
+        Path("/context/fynorra_master_with_faqs.json"),
+        Path("/context/fynorra_master_combined.json"),
+    ]
     for p in candidates:
         try:
             if p.exists():
@@ -160,7 +166,18 @@ def _is_short_greeting(txt: str) -> bool:
     if not txt:
         return False
     t = txt.lower().strip()
-    greetings = ["hi", "hello", "hey", "hiya", "yo", "good morning", "good evening", "hello ji", "namaste", "namaste ji"]
+    greetings = [
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "yo",
+        "good morning",
+        "good evening",
+        "hello ji",
+        "namaste",
+        "namaste ji",
+    ]
     if any(t == g or t.startswith(g + " ") or t.endswith(" " + g) for g in greetings):
         if len(t.split()) <= 4:
             return True
@@ -182,17 +199,17 @@ def _clean_reply(reply: str, user_message: str, allow_greeting: bool) -> str:
     # remove leading greetings unless we explicitly allow greeting
     if not allow_greeting:
         # common greeting starters to strip
-        r = re.sub(r'^\s*(namaste[^\n]*[\n]*)', '', r, flags=re.I)
-        r = re.sub(r'^\s*(hi[^\n]*[\n]*)', '', r, flags=re.I)
-        r = re.sub(r'^\s*(hello[^\n]*[\n]*)', '', r, flags=re.I)
-        r = re.sub(r'^\s*(hey[^\n]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r"^\s*(namaste[^\n]*[\n]*)", "", r, flags=re.I)
+        r = re.sub(r"^\s*(hi[^\n]*[\n]*)", "", r, flags=re.I)
+        r = re.sub(r"^\s*(hello[^\n]*[\n]*)", "", r, flags=re.I)
+        r = re.sub(r"^\s*(hey[^\n]*[\n]*)", "", r, flags=re.I)
 
         # remove stock lead-ins like "How can I help you today?" if at start
-        r = re.sub(r'^\s*(how can i (help|assist) you (today)?[.?!]*[\n]*)', '', r, flags=re.I)
-        r = re.sub(r'^\s*(how may I help you[.?!]*[\n]*)', '', r, flags=re.I)
+        r = re.sub(r"^\s*(how can i (help|assist) you (today)?[.?!]*[\n]*)", "", r, flags=re.I)
+        r = re.sub(r"^\s*(how may I help you[.?!]*[\n]*)", "", r, flags=re.I)
 
     # trim excessive whitespace and repeated newlines
-    r = re.sub(r'\n{3,}', '\n\n', r).strip()
+    r = re.sub(r"\n{3,}", "\n\n", r).strip()
 
     return r
 
@@ -203,7 +220,10 @@ async def chat_endpoint(request: Request):
     message_text, session_id = "", None
 
     if "multipart/form-data" in ct:
-        raise HTTPException(status_code=400, detail="File uploads are disabled on this deployment. Use demo project for file uploads.")
+        raise HTTPException(
+            status_code=400,
+            detail="File uploads are disabled on this deployment. Use demo project for file uploads.",
+        )
 
     body = await request.json()
     message_text = (body.get("message") or body.get("text") or "").strip()
@@ -215,14 +235,18 @@ async def chat_endpoint(request: Request):
     db.save_message(conversation_id, role="user", text=message_text, file_url=None)
 
     recent_history = db.get_last_messages(conversation_id, limit=20) or []
-    assistant_has_greeted = any(m.get("role") == "assistant" and re.search(r"\b(namaste|hi|hello)\b", (m.get("text") or ""), re.I) for m in recent_history)
+    assistant_has_greeted = any(
+        m.get("role") == "assistant"
+        and re.search(r"\b(namaste|hi|hello)\b", (m.get("text") or ""), re.I)
+        for m in recent_history
+    )
 
     use_hinglish = False
     if re.search(r"\b(hindi|hinglish|हिंदी|हिंग्लिश|bol in hindi|bol hindi|हेलो हिंदी)\b", message_text, re.I):
         use_hinglish = True
 
     # ---------------------------
-    # Greeting / choice logic (kept, but now explicit and minimal)
+    # Greeting / choice logic (kept, but minimal)
     # ---------------------------
     # 1) If user sends a short greeting and assistant hasn't greeted -> reply with one-line greeting only
     if _is_short_greeting(message_text) and not assistant_has_greeted:
@@ -235,7 +259,11 @@ async def chat_endpoint(request: Request):
         for m in reversed(history):
             if m.get("role") == "assistant":
                 txt = (m.get("text") or "").lower()
-                if "would you like" in txt and ("overview" in txt or "talk about your business needs" in txt or "reply with 'overview' or 'needs'" in txt):
+                if "would you like" in txt and (
+                    "overview" in txt
+                    or "talk about your business needs" in txt
+                    or "reply with 'overview' or 'needs'" in txt
+                ):
                     return True
         return False
 
@@ -330,4 +358,125 @@ async def chat_endpoint(request: Request):
     lang_pref = "Prefer English in responses. Switch to Hinglish only if user asks." if not use_hinglish else "Use Hinglish for responses."
     system_prompt = BASE_PERSONA + "\n" + lang_pref
 
-    # final_context: keep short, only sou_
+    # final_context: keep short, only sources (avoid feeding full history or long marketing)
+    final_context = sources_text
+
+    # ---------- DEBUG + SAFE LLM PATCH ----------
+    debug_id = f"dbg-{int(time.time())}"
+    logger.info("[%s] chat start: session=%s message=%s", debug_id, session_id, (message_text or "")[:400])
+    logger.info(
+        "[%s] ENV LLM_MODEL present? %s | OPENAI_KEY present? %s",
+        debug_id,
+        bool(os.environ.get("LLM_MODEL")),
+        bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_APIKEY")),
+    )
+
+    # Quick static fallback for urgent service queries (temporary)
+    lower_msg = (message_text or "").lower()
+    if any(
+        k in lower_msg
+        for k in [
+            "what services",
+            "what do you offer",
+            "services fynorra",
+            "what services fynorra provide",
+            "services you provide",
+            "what services do you provide",
+        ]
+    ):
+        quick = (
+            "AI Chatbots (Website & WhatsApp); RAG Assistants (doc-backed Q&A); "
+            "Document OCR & Automation; CRM Integrations; Dashboards & Analytics."
+        )
+        db.save_message(conversation_id, role="assistant", text=quick, file_url=None)
+        logger.info("[%s] Returned QUICK STATIC services reply (fallback).", debug_id)
+        return JSONResponse({"reply": quick, "session_id": session_id, "is_lead": False, "lead": None})
+
+    reply = None
+    try:
+        logger.debug("[%s] SYSTEM_PROMPT (truncated): %s", debug_id, system_prompt[:1500])
+        logger.debug("[%s] CONTEXT (truncated): %s", debug_id, (final_context or "")[:2000])
+
+        reply = llm_handler.get_llm_response(
+            system_prompt=system_prompt,
+            context=final_context,
+            user_question=message_text,
+            model=os.environ.get("LLM_MODEL", None),
+            request_type="chat",
+        )
+
+        logger.info("[%s] LLM returned (len=%d)", debug_id, len(reply or ""))
+        logger.debug("[%s] LLM reply (truncated): %s", debug_id, (reply or "")[:2000])
+
+    except Exception as e:
+        logger.exception("[%s] LLM call exception: %s", debug_id, e)
+        err_msg = "⚠️ Assistant failed to generate a response (LLM error). Check server logs."
+        db.save_message(conversation_id, role="assistant", text=err_msg, file_url=None)
+        return JSONResponse({"reply": err_msg, "error": str(e)}, status_code=500)
+
+    # Fallback if LLM returns empty or whitespace
+    if not reply or not str(reply).strip():
+        logger.warning("[%s] LLM returned empty reply, using fallback message.", debug_id)
+        fallback = "I don't have that information right now. Would you like me to connect you with our team?"
+        db.save_message(conversation_id, role="assistant", text=fallback, file_url=None)
+        return JSONResponse({"reply": fallback, "session_id": session_id})
+
+    # Post-process reply: remove greeting/lead-ins if user did not greet
+    cleaned = _clean_reply(reply, message_text, allow_greeting=_is_short_greeting(message_text))
+    if not cleaned:
+        cleaned = "I don't have that information right now. Would you like me to connect you with our team?"
+
+    db.save_message(conversation_id, role="assistant", text=cleaned, file_url=None)
+
+    # Lead detection
+    def extract_contact(text: str):
+        email_re = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+        phone_re = r"(\+?\d[\d\s\-\(\)]{6,}\d)"
+        return bool(re.search(email_re, text)), bool(re.search(phone_re, text))
+
+    KEYWORD_WEIGHTS = {
+        r"\b(demo|schedule demo|book demo)\b": 0.95,
+        r"\b(price|pricing|cost|quote)\b": 0.85,
+        r"\b(interested|want to buy|purchase|signup|sign up|get started)\b": 0.75,
+        r"\b(contact|call me|reach out|connect)\b": 0.65,
+        r"\b(schedule|meeting|request demo)\b": 0.8,
+    }
+
+    def compute_interest_score(text: str):
+        score = 0.0
+        txt = (text or "").lower()
+        for kw_re, w in KEYWORD_WEIGHTS.items():
+            if re.search(kw_re, txt):
+                score = max(score, w)
+        return score
+
+    combined_text = (message_text or "") + " " + (cleaned or "")
+    contact_email_present, contact_phone_present = extract_contact(combined_text)
+    score_message = compute_interest_score(message_text)
+    score_combined = compute_interest_score(combined_text)
+
+    if contact_email_present or contact_phone_present:
+        score_combined = max(score_combined, 0.98)
+
+    LEAD_THRESHOLD = float(os.environ.get("LEAD_THRESHOLD", 0.75))
+    is_lead = score_combined >= LEAD_THRESHOLD
+
+    if not is_lead:
+        words = (message_text or "").strip().split()
+        if len(words) < 6 and any(qw in (message_text or "").lower() for qw in ["what", "who", "how", "tell", "batao", "kya"]):
+            is_lead = False
+
+    lead = None
+    if is_lead:
+        lead = db.create_lead(
+            conversation_id,
+            snippet=(message_text or "")[:500],
+            score=float(score_combined),
+            metadata={"detected_contact": contact_email_present or contact_phone_present},
+        )
+        try:
+            db.notify_sales(lead)
+        except Exception as e:
+            logger.exception("Notify sales failed: %s", e)
+
+    return JSONResponse({"reply": cleaned, "session_id": session_id, "is_lead": is_lead, "lead": lead})
